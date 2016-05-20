@@ -11,6 +11,7 @@ import base64
 import re
 import os
 import sys
+from collections import defaultdict
 
 import pandas as pd
 from prettytable import PrettyTable
@@ -21,6 +22,7 @@ from .queries import postgres as postgres_templates
 from .queries import sqlite as sqlite_templates
 from .queries import mssql as mssql_templates
 
+from .utils import profile_path
 
 queries_templates = {
     "mysql": mysql_templates,
@@ -73,15 +75,21 @@ except ImportError:
     HAS_PYMSSQL = False
 
 
+DBPY_PROFILE_ID = ".db.py_"
+S3_PROFILE_ID = ".db.py_s3_"
+
+
 class Column(object):
     """
     A Columns is an in-memory reference to a column in a particular table. You
     can use it to do some basic DB exploration and you can also use it to
     execute simple queries.
     """
-    def __init__(self, con, query_templates, table, name, dtype, keys_per_column):
+
+    def __init__(self, con, query_templates, schema, table, name, dtype, keys_per_column):
         self._con = con
         self._query_templates = query_templates
+        self.schema = schema
         self.table = table
         self.name = name
         self.type = dtype
@@ -110,7 +118,7 @@ class Column(object):
         for col in self.foreign_keys:
             keys.append("%s.%s" % (col.table, col.name))
         if self.keys_per_column is not None and len(keys) > self.keys_per_column:
-            keys = keys[0:self.keys_per_column] + ['(+ {0} more)'.format(len(keys)-self.keys_per_column)]
+            keys = keys[0:self.keys_per_column] + ['(+ {0} more)'.format(len(keys) - self.keys_per_column)]
         return ", ".join(keys)
 
     def _str_ref_keys(self):
@@ -118,7 +126,7 @@ class Column(object):
         for col in self.ref_keys:
             keys.append("%s.%s" % (col.table, col.name))
         if self.keys_per_column is not None and len(keys) > self.keys_per_column:
-            keys = keys[0:self.keys_per_column] + ['(+ {0} more)'.format(len(keys)-self.keys_per_column)]
+            keys = keys[0:self.keys_per_column] + ['(+ {0} more)'.format(len(keys) - self.keys_per_column)]
         return ", ".join(keys)
 
     def head(self, n=6):
@@ -152,8 +160,9 @@ class Column(object):
         1              Stuttgart
         Name: City, dtype: object
         """
-        q = self._query_templates['column']['head'].format(column=self.name, table=self.table, n=n)
-        return pd.io.sql.read_sql(q, self._con)[self.name]
+        q = self._query_templates['column']['head'].format(column=self.name, schema=self.schema,
+                                                           table=self.table, n=n)
+        return pd.read_sql(q, self._con)[self.name]
 
     def all(self):
         """
@@ -168,26 +177,20 @@ class Column(object):
         --------
         >>> from db import DemoDB
         >>> db = DemoDB()
-        >>> db.tables.Customer.Email.all()
-        0              luisg@embraer.com.br
-        1             leonekohler@surfeu.de
-        2               ftremblay@gmail.com
-        3             bjorn.hansen@yahoo.no
-        4          frantisekw@jetbrains.com
-        5                   hholy@gmail.com
-        6            astrid.gruber@apple.at
-        7             daan_peeters@apple.be
-        8             kara.nielsen@jubii.dk
-        9          eduardo@woodstock.com.br
-        10                 alero@uol.com.br
-        11    roberto.almeida@riotur.gov.br
-        ...
+        >>> db.tables.Customer.Email.all().head()
+        0        luisg@embraer.com.br
+        1       leonekohler@surfeu.de
+        2         ftremblay@gmail.com
+        3       bjorn.hansen@yahoo.no
+        4    frantisekw@jetbrains.com
+        Name: Email, dtype: object
         >>> df = db.tables.Customer.Email.all()
         >>> len(df)
-            59
+        59
         """
-        q = self._query_templates['column']['all'].format(column=self.name, table=self.table)
-        return pd.io.sql.read_sql(q, self._con)[self.name]
+        q = self._query_templates['column']['all'].format(column=self.name, schema=self.schema,
+                                                          table=self.table)
+        return pd.read_sql(q, self._con)[self.name]
 
     def unique(self):
         """
@@ -202,23 +205,24 @@ class Column(object):
         --------
         >>> from db import DemoDB
         >>> db = DemoDB()
-        >>> db.tables.Customer.FirstName.unique()
-        0          Luis
-        1        Leonie
-        2      Francois
-        3         Bjorn
-        4     Frantisek
-        5        Helena
-        6        Astrid
-        7          Daan
-        8          Kara
-        9       Eduardo
-        10    Alexandre
-        ...
+        >>> db.tables.Customer.FirstName.unique().head(10)
+        0         Luis
+        1       Leonie
+        2     Francois
+        3        Bjorn
+        4    Franti\u0161ek
+        5       Helena
+        6       Astrid
+        7         Daan
+        8         Kara
+        9      Eduardo
+        Name: FirstName, dtype: object
         >>> len(db.tables.Customer.LastName.unique())
+        59
         """
-        q = self._query_templates['column']['unique'].format(column=self.name, table=self.table)
-        return pd.io.sql.read_sql(q, self._con)[self.name]
+        q = self._query_templates['column']['unique'].format(column=self.name, schema=self.schema,
+                                                             table=self.table)
+        return pd.read_sql(q, self._con)[self.name]
 
     def sample(self, n=10):
         """
@@ -236,32 +240,45 @@ class Column(object):
         n: int
             number of rows to sample
 
-        Examples
+        Examples (removed from doctest as we can't predict random names...)
         --------
+        from db import DemoDB
+        db = DemoDB()
+        db.tables.Artist.Name.sample(10)
+        0                        Pedro Luis & A Parede
+        1                   Santana Feat. Eric Clapton
+        2                                  Os Mutantes
+        3                              Banda Black Rio
+        4               Adrian Leaper & Doreen de Feis
+        5    Chicago Symphony Orchestra & Fritz Reiner
+        6                            Smashing Pumpkins
+        7                                   Spyro Gyra
+        8    Aaron Copland & London Symphony Orchestra
+        9      Sir Georg Solti & Wiener Philharmoniker
+        Name: Name, dtype: object
         >>> from db import DemoDB
         >>> db = DemoDB()
-        >>> db.tables.Artist.Name.sample(10)
-        0                     Julian Bream
-        1                         Godsmack
-        2                             Lost
-        3                         Fretwork
-        4            Pedro Luis E A Parede
-        5            Philip Glass Ensemble
-        6                      Marvin Gaye
-        7                        Metallica
-        8                Alanis Morissette
-        9    Santana Feat. The Project G&B
-        Name: Name, dtype: object
+        >>> df = db.tables.Artist.Name.sample(10)
+        >>> len(df)
+        10
         """
-        q = self._query_templates['column']['sample'].format(column=self.name, table=self.table, n=n)
-        return pd.io.sql.read_sql(q, self._con)[self.name]
+        q = self._query_templates['column']['sample'].format(column=self.name, schema=self.schema,
+                                                             table=self.table, n=n)
+        return pd.read_sql(q, self._con)[self.name]
+
+    def to_dict(self):
+        """Serialize representation of the column for local caching."""
+        return {'schema': self.schema, 'table': self.table, 'name': self.name, 'type': self.type}
+
 
 class Table(object):
     """
     A Table is an in-memory reference to a table in a database. You can use it to get more info
     about the columns, schema, etc. of a table and you can also use it to execute queries.
     """
-    def __init__(self, con, query_templates, name, cols, keys_per_column):
+
+    def __init__(self, con, query_templates, schema, name, cols, keys_per_column, foreign_keys=None, ref_keys=None):
+        self.schema = schema
         self.name = name
         self._con = con
         self._cur = con.cursor()
@@ -273,28 +290,43 @@ class Table(object):
         self._columns = cols
         for col in cols:
             attr = col.name
-            if attr in ("name", "con"):
-                attr = "_" + col.name
+            if attr in ("name", "con", "count"):
+                attr = self.name + "_" + col.name
             setattr(self, attr, col)
 
-        self._cur.execute(self._query_templates['system']['foreign_keys_for_table'].format(table=self.name))
-        for (column_name, foreign_table, foreign_column) in self._cur:
+        # ToDo: factor out common logic below
+        # load foreign keys if not provided
+        if not isinstance(foreign_keys, list):
+            self._cur.execute(self._query_templates['system']['foreign_keys_for_table'].format(table=self.name,
+                                                                                               table_schema=self.schema))
+            foreign_keys = self._cur
+
+        # build columns from the foreign keys metadata we have
+        for (column_name, foreign_table, foreign_column) in foreign_keys:
             col = getattr(self, column_name)
             foreign_key = Column(con, queries_templates, foreign_table, foreign_column, col.type, self.keys_per_column)
             self.foreign_keys.append(foreign_key)
             col.foreign_keys.append(foreign_key)
             setattr(self, column_name, col)
 
+        # store the foreign keys as a special group of columns
         self.foreign_keys = ColumnSet(self.foreign_keys)
 
-        self._cur.execute(self._query_templates['system']['ref_keys_for_table'].format(table=self.name))
-        for (column_name, ref_table, ref_column) in self._cur:
+        # load ref keys if not provided
+        if not isinstance(ref_keys, list):
+            self._cur.execute(self._query_templates['system']['ref_keys_for_table'].format(table=self.name,
+                                                                                           table_schema=self.schema))
+            ref_keys = self._cur
+
+        # build columns for the ref key metadata we have
+        for (column_name, ref_table, ref_column) in ref_keys:
             col = getattr(self, column_name)
             ref_key = Column(con, queries_templates, ref_table, ref_column, col.type, self.keys_per_column)
             self.ref_keys.append(ref_key)
             col.ref_keys.append(ref_key)
             setattr(self, column_name, col)
 
+        # store ref keys as a special group of columns
         self.ref_keys = ColumnSet(self.ref_keys)
 
     def _tablify(self):
@@ -310,8 +342,8 @@ class Table(object):
     def __repr__(self):
         tbl = str(self._tablify())
         r = tbl.split('\n')[0]
-        brk = "+" + "-"*(len(r)-2) + "+"
-        title = "|" + self.name.center(len(r)-2) + "|"
+        brk = "+" + "-" * (len(r) - 2) + "+"
+        title = "|" + self.name.center(len(r) - 2) + "|"
         return brk + "\n" + title + "\n" + tbl
 
     def __str__(self):
@@ -339,9 +371,13 @@ class Table(object):
         Examples
         --------
         >>> from db import DemoDB
-        >>> db = DemoDB()
+        >>> db = DemoDB()       
+        >>> db.tables.Track.select("Name")[:1].Name
+        0    For Those About To Rock (We Salute You)
+        Name: Name, dtype: object
+        
         # select name from the Track table
-        >>> db.tables.Track.select("Name")
+        db.tables.Track.select("Name")
                                                            Name
         0               For Those About To Rock (We Salute You)
         1                                     Balls to the Wall
@@ -357,8 +393,9 @@ class Table(object):
         # select name & composer from the Track table
         >>> df = db.tables.Track.select("Name", "Composer")
         """
-        q = self._query_templates['table']['select'].format(columns=", ".join(args), table=self.name)
-        return pd.io.sql.read_sql(q, self._con)
+        q = self._query_templates['table']['select'].format(columns=", ".join(args), schema=self.schema,
+                                                            table=self.name)
+        return pd.read_sql(q, self._con)
 
     def head(self, n=6):
         """
@@ -378,8 +415,14 @@ class Table(object):
         --------
         >>> from db import DemoDB
         >>> db = DemoDB()
-        # select name from the Track table
-        >>> db.tables.Track.head()
+        
+        
+        >>> db.tables.Track.count
+        3503
+        
+        -= Not in doctest as output is hard to predict
+        # select name from the Track table        
+        db.tables.Track.head()
            TrackId                                     Name  AlbumId  MediaTypeId  \
         0        1  For Those About To Rock (We Salute You)        1            1
         1        2                        Balls to the Wall        2            2
@@ -403,7 +446,8 @@ class Table(object):
         3   4331779       0.99
         4   6290521       0.99
         5   6713451       0.99
-        >>> db.tables.Track.head(1)
+        
+        db.tables.Track.head(1)
            TrackId                                     Name  AlbumId  MediaTypeId  \
         0        1  For Those About To Rock (We Salute You)        1            1
 
@@ -413,8 +457,9 @@ class Table(object):
            UnitPrice
         0       0.99
         """
-        q = self._query_templates['table']['head'].format(table=self.name, n=n)
-        return pd.io.sql.read_sql(q, self._con)
+        q = self._query_templates['table']['head'].format(schema=self.schema,
+                                                          table=self.name, n=n)
+        return pd.read_sql(q, self._con)
 
     def all(self):
         """
@@ -429,12 +474,13 @@ class Table(object):
         >>> from db import DemoDB
         >>> db = DemoDB()
         >>> len(db.tables.Track.all())
-            3503
+        3503
         >>> df = db.tables.Track.all()
         """
 
-        q = self._query_templates['table']['all'].format(table=self.name)
-        return pd.io.sql.read_sql(q, self._con)
+        q = self._query_templates['table']['all'].format(schema=self.schema,
+                                                         table=self.name)
+        return pd.read_sql(q, self._con)
 
     def unique(self, *args):
         """
@@ -457,41 +503,42 @@ class Table(object):
         >>> from db import DemoDB
         >>> db = DemoDB()
         >>> db.tables.Track.unique("GenreId")
-                GenreId
-            0         1
-            1         2
-            2         3
-            3         4
-            4         5
-            5         6
-            6         7
-            7         8
-            8         9
-            9        10
-            10       11
-            11       12
-            12       13
-            13       14
-            14       15
-            15       16
-            16       17
-            17       18
-            18       19
-            19       20
-            20       21
-            21       22
-            22       23
-            23       24
-            24       25
+            GenreId
+        0         1
+        1         2
+        2         3
+        3         4
+        4         5
+        5         6
+        6         7
+        7         8
+        8         9
+        9        10
+        10       11
+        11       12
+        12       13
+        13       14
+        14       15
+        15       16
+        16       17
+        17       18
+        18       19
+        19       20
+        20       21
+        21       22
+        22       23
+        23       24
+        24       25
         >>> len(db.tables.Track.unique("GenreId", "MediaTypeId"))
-            38
+        38
         """
-        if len(args)==0:
+        if len(args) == 0:
             columns = "*"
         else:
             columns = ", ".join(args)
-        q = self._query_templates['table']['unique'].format(columns=columns, table=self.name)
-        return pd.io.sql.read_sql(q, self._con)
+        q = self._query_templates['table']['unique'].format(columns=columns, schema=self.schema,
+                                                            table=self.name)
+        return pd.read_sql(q, self._con)
 
     def sample(self, n=10):
         """
@@ -511,9 +558,10 @@ class Table(object):
 
         Examples
         --------
-        >>> from db import DemoDB
-        >>> db = DemoDB()
-        >>> db.tables.Track.sample(10)
+        from db import DemoDB
+        db = DemoDB()
+        Not in doctest : can't predict sample        
+        db.tables.Track.sample(10)
            TrackId                                               Name  AlbumId  \
         0      274                                      Samba Makossa       25
         1     1971                                Girls, Girls, Girls      162
@@ -550,39 +598,60 @@ class Table(object):
         8        283951   9258717       0.99
         9        404453  13186975       0.99
         """
-        q = self._query_templates['table']['sample'].format(table=self.name, n=n)
-        return pd.io.sql.read_sql(q, self._con)
+        q = self._query_templates['table']['sample'].format(schema=self.schema,
+                                                            table=self.name, n=n)
+        return pd.read_sql(q, self._con)
 
     @property
     def count(self):
         """Return total of rows from table."""
         return len(self.all())
 
+    def to_dict(self):
+        """Serialize representation of the table for local caching."""
+        return {'schema': self.schema, 'name': self.name, 'columns': [col.to_dict() for col in self._columns],
+                'foreign_keys': self.foreign_keys.to_dict(), 'ref_keys': self.ref_keys.to_dict()}
+
 
 class TableSet(object):
     """
     Set of Tables. Used for displaying search results in terminal/ipython notebook.
     """
+
     def __init__(self, tables):
+        self.pretty_tbl_cols = ["Table", "Columns"]
+        self.use_schema = False
+
         for tbl in tables:
             setattr(self, tbl.name, tbl)
+            if tbl.schema and not self.use_schema:
+                self.use_schema = True
+                self.pretty_tbl_cols.insert(0, "Schema")
+
         self.tables = tables
 
     def __getitem__(self, i):
         return self.tables[i]
 
     def _tablify(self):
-        tbl = PrettyTable(["Table", "Columns"])
-        tbl.align["Table"] = "l"
-        tbl.align["Columns"] = "l"
+        tbl = PrettyTable(self.pretty_tbl_cols)
+
+        for col in self.pretty_tbl_cols:
+            tbl.align[col] = "l"
+
         for table in self.tables:
             column_names = [col.name for col in table._columns]
             column_names = ", ".join(column_names)
             pretty_column_names = ""
+
             for i in range(0, len(column_names), 80):
-                pretty_column_names += column_names[i:(i+80)] + "\n"
+                pretty_column_names += column_names[i:(i + 80)] + "\n"
             pretty_column_names = pretty_column_names.strip()
-            tbl.add_row([table.name, pretty_column_names])
+            row_data = [table.name, pretty_column_names]
+            if self.use_schema:
+                row_data.insert(0, table.schema)
+            tbl.add_row(row_data)
+
         return tbl
 
     def __repr__(self):
@@ -591,25 +660,45 @@ class TableSet(object):
 
     def _repr_html_(self):
         return self._tablify().get_html_string()
+
+    def __len__(self):
+        return len(self.tables)
+
+    def to_dict(self):
+        """Serialize representation of the tableset for local caching."""
+        return {'tables': [table.to_dict() for table in self.tables]}
+
 
 class ColumnSet(object):
     """
     Set of Columns. Used for displaying search results in terminal/ipython
     notebook.
     """
+
     def __init__(self, columns):
         self.columns = columns
+        self.pretty_tbl_cols = ["Table", "Column Name", "Type"]
+        self.use_schema = False
+
+        for col in columns:
+            if col.schema and not self.use_schema:
+                self.use_schema = True
+                self.pretty_tbl_cols.insert(0, "Schema")
 
     def __getitem__(self, i):
         return self.columns[i]
 
     def _tablify(self):
-        tbl = PrettyTable(["Table", "Column Name", "Type"])
-        tbl.align["Table"] = "l"
-        tbl.align["Column"] = "l"
-        tbl.align["Type"] = "l"
+        tbl = PrettyTable(self.pretty_tbl_cols)
+
+        for col in self.pretty_tbl_cols:
+            tbl.align[col] = "l"
+
         for col in self.columns:
-            tbl.add_row([col.table, col.name, col.type])
+            row_data = [col.table, col.name, col.type]
+            if self.use_schema:
+                row_data.insert(0, col.schema)
+            tbl.add_row(row_data)
         return tbl
 
     def __repr__(self):
@@ -619,10 +708,16 @@ class ColumnSet(object):
     def _repr_html_(self):
         return self._tablify().get_html_string()
 
+    def to_dict(self):
+        """Serialize representation of the tableset for local caching."""
+        return {'columns': [col.to_dict() for col in self.columns]}
+
+
 class S3(object):
     """
     Simple object for storing AWS credentials
     """
+
     def __init__(self, access_key, secret_key, profile=None):
 
         if profile:
@@ -640,18 +735,12 @@ class S3(object):
         profile: str
             name for your profile (i.e. "dev", "prod")
         """
-        home = os.path.expanduser("~")
-        filename = os.path.join(home, ".db.py_s3_" + profile)
+        filename = profile_path(S3_PROFILE_ID, profile)
         creds = {
             "access_key": self.access_key,
             "secret_key": self.secret_key
         }
-        with open(filename, 'wb') as f:
-            data = json.dumps(creds)
-            try:
-                f.write(base64.encodestring(data))
-            except:
-                f.write(base64.encodestring(bytes(data, 'utf-8')))
+        dump_to_json(filename, creds)
 
     def load_credentials(self, profile):
         """
@@ -665,8 +754,7 @@ class S3(object):
         profile: str
             identifier/name for your database (i.e. "dev", "prod")
         """
-        user = os.path.expanduser("~")
-        f = os.path.join(user, ".db.py_s3_" + profile)
+        f = profile_path(S3_PROFILE_ID, profile)
         if os.path.exists(f):
             creds = json.loads(base64.decodestring(open(f, 'rb').read()).encode('utf-8'))
             if 'access_key' not in creds:
@@ -723,21 +811,27 @@ class DB(object):
 
     Examples
     --------
-    >>> from db import DB
-    >>> db = DB(username="kermit", password="ilikeflies", hostname="themuppets.com",
-                port=5432, dbname="muppets", dbtype="postgres")
-    >>> db = DB(username="fozzybear", password="wakawakawaka", hostname="ec2.523.24.131",
-                port=5432, dbname="muppets_redshift", dbtype="redshift")
-    >>> db = DB(username="dev", hostname="localhost",
-                port=5432, dbname="devdb", dbtype="postgres")
-    >>> db = DB(username="root", hostname="localhost", dbname="employees", dbtype="mysql")
-    >>> db = DB(filename="/path/to/mydb.sqlite", dbtype="sqlite")
-    >>> db = DB(dbname="AdventureWorks2012", dbtype="mssql", driver="{FreeTDS}")
+    db = DB(dbname="AdventureWorks2012", dbtype="mssql", driver="{FreeTDS}")
+        
+    from db import DB
+    try:
+        __import__('imp').find_module('psycopg2')
+        db = DB(username="kermit", password="ilikeflies", hostname="themuppets.com", port=5432, dbname="muppets", dbtype="postgres")
+        db = DB(username="dev", hostname="localhost", port=5432, dbname="devdb", dbtype="postgres")
+        db = DB(username="fozzybear", password="wakawakawaka", hostname="ec2.523.24.131", port=5432, dbname="muppets_redshift", dbtype="redshift")
+    except ImportError:
+        pass
+    try:
+        __import__('imp').find_module('pymysql')
+        db = DB(username="root", hostname="localhost", dbname="employees", dbtype="mysql")
+        db = DB(filename="/path/to/mydb.sqlite", dbtype="sqlite")
+    except ImportError:
+        pass
     """
     def __init__(self, username=None, password=None, hostname="localhost",
             port=None, filename=None, dbname=None, dbtype=None, schemas=None,
             profile="default", exclude_system_tables=True, limit=1000,
-            keys_per_column=None, driver=None):
+            keys_per_column=None, driver=None, cache=False):
 
         if port is None:
             if dbtype=="postgres":
@@ -755,10 +849,15 @@ class DB(object):
             else:
                 raise Exception("Database type not specified! Must select one of: postgres, sqlite, mysql, mssql, or redshift")
 
-        if not dbtype in ("sqlite", "mssql") and username is None:
+        self._use_cache = cache
+        if dbtype not in ("sqlite", "mssql") and username is None:
             self.load_credentials(profile)
+            if cache:
+                self._metadata_cache = self.load_metadata(profile)
         elif dbtype=="sqlite" and filename is None:
             self.load_credentials(profile)
+            if cache:
+                self._metadata_cache = self.load_metadata(profile)
         else:
             self.username = username
             self.password = password
@@ -838,7 +937,9 @@ class DB(object):
                             pwd=self.password)
                     self.cur = self.con.cursor()
             elif HAS_PYMSSQL:
-                if hasattr(self, 'port'):
+                if '\\' in self.hostname:
+                    hostname = self.hostname
+                elif hasattr(self, 'port'):
                     hostname = '{0}:{1}'.format(self.hostname, self.port)
                 else:
                     hostname = self.hostname
@@ -849,9 +950,16 @@ class DB(object):
                                            database=self.dbname)
                 self.cur = self.con.cursor()
 
-        self.tables = TableSet([])
-        self.refresh_schema(exclude_system_tables)
+        self._tables = TableSet([])
+        self._exclude_system_tables = exclude_system_tables
         self.handlebars = pybars.Compiler()
+
+    @property
+    def tables(self):
+        """A lazy loaded reference to the table metadata for the DB."""
+        if len(self._tables) == 0:
+            self.refresh_schema(self._exclude_system_tables, self._use_cache)
+        return self._tables
 
     def __str__(self):
         return "DB[{dbtype}][{hostname}]:{port} > {user}@{dbname}".format(
@@ -876,12 +984,9 @@ class DB(object):
         profile: str
             (optional) identifier/name for your database (i.e. "dw", "prod")
         """
-        user = os.path.expanduser("~")
-        f = os.path.join(user, ".db.py_" + profile)
-        if os.path.exists(f):
-            raw_creds = open(f, 'rb').read()
-            raw_creds = base64.decodestring(raw_creds).decode('utf-8')
-            creds = json.loads(raw_creds)
+        f = profile_path(DBPY_PROFILE_ID, profile)
+        if f:
+            creds = load_from_json(f)
             self.username = creds.get('username')
             self.password = creds.get('password')
             self.hostname = creds.get('hostname')
@@ -904,22 +1009,43 @@ class DB(object):
         profile: str
             (optional) identifier/name for your database (i.e. "dw", "prod")
 
-        >>> db = DB(username="hank", password="foo",
-        >>>         hostname="prod.mardukas.com", dbname="bar")
-        >>> db.save_credentials(profile="production")
-        >>> db = DB(username="hank", password="foo",
-        >>>         hostname="staging.mardukas.com", dbname="bar")
-        >>> db.save_credentials(profile="staging")
-        >>> db = DB(profile="staging")
+        from db import DB
+        import pymysql
+        db = DB(username="hank", password="foo", hostname="prod.mardukas.com", dbname="bar", dbtype="mysql")
+        db.save_credentials(profile="production")
+        db = DB(username="hank", password="foo", hostname="staging.mardukas.com", dbname="bar", dbtype="mysql")
+        db.save_credentials(profile="staging")
+        db = DB(profile="staging")
+        
+        >>> from db import DemoDB
+        >>> db = DemoDB()
+        >>> db.save_credentials(profile='test')
         """
+        f = profile_path(DBPY_PROFILE_ID, profile)
+        dump_to_json(f, self.credentials)
+
+    @staticmethod
+    def load_metadata(profile="default"):
+        f = profile_path(DBPY_PROFILE_ID, profile)
+        if f:
+            prof = load_from_json(f)
+            return prof.get('tables', None)
+
+    def save_metadata(self, profile="default"):
+        """Save the database credentials, plus the database properties to your db.py profile."""
+        if len(self.tables) > 0:
+            f = profile_path(DBPY_PROFILE_ID, profile)
+            dump_to_json(f, self.to_dict())
+
+    @property
+    def credentials(self):
+        """Dict representation of all credentials for the database."""
         if self.filename:
             db_filename = os.path.join(os.getcwd(), self.filename)
         else:
             db_filename = None
 
-        user = os.path.expanduser("~")
-        dotfile = os.path.join(user, ".db.py_" + profile)
-        creds = {
+        return {
             "username": self.username,
             "password": self.password,
             "hostname": self.hostname,
@@ -931,12 +1057,6 @@ class DB(object):
             "limit": self.limit,
             "keys_per_column": self.keys_per_column,
         }
-        with open(dotfile, 'wb') as f:
-            data = json.dumps(creds)
-            try:
-                f.write(base64.encodestring(data))
-            except:
-                f.write(base64.encodestring(bytes(data, 'utf-8')))
 
     def find_table(self, search):
         """
@@ -952,12 +1072,12 @@ class DB(object):
         >>> from db import DemoDB
         >>> db = DemoDB()
         >>> db.find_table("A*")
-            +--------+--------------------------+
-            | Table  | Columns                  |
-            +--------+--------------------------+
-            | Album  | AlbumId, Title, ArtistId |
-            | Artist | ArtistId, Name           |
-            +--------+--------------------------+
+        +--------+--------------------------+
+        | Table  | Columns                  |
+        +--------+--------------------------+
+        | Album  | AlbumId, Title, ArtistId |
+        | Artist | ArtistId, Name           |
+        +--------+--------------------------+
         >>> results = db.find_table("tmp*") # returns all tables prefixed w/ tmp
         >>> results = db.find_table("prod_*") # returns all tables prefixed w/ prod_
         >>> results = db.find_table("*Invoice*") # returns all tables containing trans
@@ -984,7 +1104,20 @@ class DB(object):
         ----------
         >>> from db import DemoDB
         >>> db = DemoDB()
-        >>> db.find_column("Name") # returns all columns named "Name"
+        >>> len(db.find_column("Name").columns)
+        5
+        >>> len(db.find_column("*Id").columns)
+        20
+        >>> len(db.find_column("*Address*").columns)
+        3
+        >>> len(db.find_column("*Address*", data_type="NVARCHAR(70)").columns)
+        3
+        >>> len(db.find_column("*e*", data_type=["NVARCHAR(70)", "INTEGER"]).columns)
+        17
+            
+        -= Should sort in some way for all those doctests to be viable... 
+        -= if not, there's always a random issue where rows are not in the same order, making doctest fail.
+        db.find_column("Name") # returns all columns named "Name"
         +-----------+-------------+---------------+
         | Table     | Column Name | Type          |
         +-----------+-------------+---------------+
@@ -994,7 +1127,7 @@ class DB(object):
         | Playlist  |     Name    | NVARCHAR(120) |
         | Track     |     Name    | NVARCHAR(200) |
         +-----------+-------------+---------------+
-        >>> db.find_column("*Id") # returns all columns ending w/ Id
+        db.find_column("*Id") # returns all columns ending w/ Id
         +---------------+---------------+---------+
         | Table         |  Column Name  | Type    |
         +---------------+---------------+---------+
@@ -1007,19 +1140,19 @@ class DB(object):
         | Genre         |    GenreId    | INTEGER |
         | Invoice       |   InvoiceId   | INTEGER |
         | Invoice       |   CustomerId  | INTEGER |
-        | InvoiceLine   |   InvoiceId   | INTEGER |
         | InvoiceLine   |    TrackId    | INTEGER |
         | InvoiceLine   | InvoiceLineId | INTEGER |
+        | InvoiceLine   |   InvoiceId   | INTEGER |
         | MediaType     |  MediaTypeId  | INTEGER |
         | Playlist      |   PlaylistId  | INTEGER |
         | PlaylistTrack |    TrackId    | INTEGER |
         | PlaylistTrack |   PlaylistId  | INTEGER |
-        | Track         |  MediaTypeId  | INTEGER |
         | Track         |    TrackId    | INTEGER |
         | Track         |    AlbumId    | INTEGER |
+        | Track         |  MediaTypeId  | INTEGER |
         | Track         |    GenreId    | INTEGER |
         +---------------+---------------+---------+
-        >>> db.find_column("*Address*") # returns all columns containing Address
+        db.find_column("*Address*") # returns all columns containing Address
         +----------+----------------+--------------+
         | Table    |  Column Name   | Type         |
         +----------+----------------+--------------+
@@ -1027,8 +1160,36 @@ class DB(object):
         | Employee |    Address     | NVARCHAR(70) |
         | Invoice  | BillingAddress | NVARCHAR(70) |
         +----------+----------------+--------------+
-        >>> db.find_column("*Address*", data_type="NVARCHAR(70)") # returns all columns containing Address that are varchars
-        >>> db.find_column("*e*", data_type=["NVARCHAR(70)", "INTEGER"]) # returns all columns have an "e" and are NVARCHAR(70)S or INTEGERS
+        db.find_column("*Address*", data_type="NVARCHAR(70)") # returns all columns containing Address that are varchars
+        +----------+----------------+--------------+
+        | Table    |  Column Name   | Type         |
+        +----------+----------------+--------------+
+        | Customer |    Address     | NVARCHAR(70) |
+        | Employee |    Address     | NVARCHAR(70) |
+        | Invoice  | BillingAddress | NVARCHAR(70) |
+        +----------+----------------+--------------+                
+        db.find_column("*e*", data_type=["NVARCHAR(70)", "INTEGER"]) # returns all columns have an "e" and are NVARCHAR(70)S or INTEGERS
+        +-------------+----------------+--------------+
+        | Table       |  Column Name   | Type         |
+        +-------------+----------------+--------------+
+        | Customer    |    Address     | NVARCHAR(70) |
+        | Customer    |  SupportRepId  | INTEGER      |
+        | Customer    |   CustomerId   | INTEGER      |
+        | Employee    |   ReportsTo    | INTEGER      |
+        | Employee    |   EmployeeId   | INTEGER      |
+        | Employee    |    Address     | NVARCHAR(70) |
+        | Genre       |    GenreId     | INTEGER      |
+        | Invoice     |   InvoiceId    | INTEGER      |
+        | Invoice     |   CustomerId   | INTEGER      |
+        | Invoice     | BillingAddress | NVARCHAR(70) |
+        | InvoiceLine | InvoiceLineId  | INTEGER      |
+        | InvoiceLine |   InvoiceId    | INTEGER      |
+        | MediaType   |  MediaTypeId   | INTEGER      |
+        | Track       |  MediaTypeId   | INTEGER      |
+        | Track       |  Milliseconds  | INTEGER      |
+        | Track       |    GenreId     | INTEGER      |
+        | Track       |     Bytes      | INTEGER      |
+        +-------------+----------------+--------------+
         """
         if isinstance(data_type, str):
             data_type = [data_type]
@@ -1093,23 +1254,22 @@ class DB(object):
         Examples
         --------
         >>> from db import DemoDB
-        >>> db.query("select * from Track")
-           TrackId                                     Name  AlbumId  MediaTypeId  \
+        >>> db = DemoDB()
+        
+        db.query("select * from Track").head(2)
+           TrackId                                     Name  AlbumId  MediaTypeId  \\\r
         0        1  For Those About To Rock (We Salute You)        1            1
         1        2                        Balls to the Wall        2            2
-        2        3                          Fast As a Shark        3            2
-
-           GenreId                                           Composer  Milliseconds  \
-        0        1          Angus Young, Malcolm Young, Brian Johnson        343719
-        1        1                                               None        342562
-        2        1  F. Baltes, S. Kaufman, U. Dirkscneider & W. Ho...        230619
-
-              Bytes  UnitPrice
-        0  11170334       0.99
-        1   5510424       0.99
-        2   3990994       0.99
-        ...
-        >>> db.query("select * from Track", limit=10)
+        <BLANKLINE>
+           GenreId                                   Composer  Milliseconds     Bytes  \\\r
+        0        1  Angus Young, Malcolm Young, Brian Johnson        343719  11170334
+        1        1                                       None        342562   5510424
+        <BLANKLINE>
+           UnitPrice
+        0       0.99
+        1       0.99
+        
+        db.query("select * from Track", limit=10)
            TrackId                                     Name  AlbumId  MediaTypeId  \
         0        1  For Those About To Rock (We Salute You)        1            1
         1        2                        Balls to the Wall        2            2
@@ -1146,17 +1306,20 @@ class DB(object):
         8   6599424       0.99
         9   8611245       0.99
         >>> q = '''
-        SELECT
-          a.Title
-          , t.Name
-          , t.UnitPrice
-        FROM
-          Album a
-        INNER JOIN
-          Track t
-            on a.AlbumId = t.AlbumId;
-        '''
-        >>> db.query(q, limit=10)
+        ... SELECT
+        ...   a.Title,
+        ...   t.Name,
+        ...   t.UnitPrice
+        ... FROM
+        ...   Album a
+        ... INNER JOIN
+        ...   Track t
+        ...     on a.AlbumId = t.AlbumId;
+        ... '''
+        >>> len(db.query(q))
+        3503
+        
+        db.query(q, limit=10)
                                            Title  \
         0  For Those About To Rock We Salute You
         1                      Balls to the Wall
@@ -1180,39 +1343,46 @@ class DB(object):
         7                         Inject The Venom       0.99
         8                               Snowballed       0.99
         9                               Evil Walks       0.99
+        
         >>> template = '''
-        SELECT
-            '{{ name }}' as table_name
-            , COUNT(*) as cnt
-        FROM
-            {{ name }}
-        GROUP BY
-            table_name
-        '''
+        ...    SELECT
+        ...    '{{ name }}' as table_name,
+        ...    COUNT(*) as cnt
+        ... FROM
+        ...     {{ name }}
+        ... GROUP BY
+        ...     table_name
+        ... '''
         >>> data = [
-            {"name": "Album"},
-            {"name": "Artist"},
-            {"name": "Track"}
-        ]
-        >>> db.query(q, data=data)
+        ...    {"name": "Album"},
+        ...    {"name": "Artist"},
+        ...    {"name": "Track"}
+        ... ]
+        >>> 
+        
+        db.query(q, data=data)
           table_name   cnt
         0      Album   347
         1     Artist   275
         2      Track  3503
+
         >>> q = '''
-        SELECT
-        {{#cols}}
-            {{#if @last}}
-                {{ . }}
-            {{else}}
-                {{ . }} ,
-            {{/if}}
-        {{/cols}}
-        FROM
-            Album;
-        '''
+        ... SELECT
+        ... {{#cols}}
+        ...    {{#if @last}}
+        ...        {{ . }}
+        ...    {{else}}
+        ...        {{ . }} ,
+        ...    {{/if}}
+        ... {{/cols}}
+        ... FROM
+        ...    Album;
+        ... '''
         >>> data = {"cols": ["AlbumId", "Title", "ArtistId"]}
-        >>> db.query(q, data=data, union=False)
+        >>> len(db.query(q, data=data, union=False))
+        347
+        
+        db.query(q, data=data, union=False)
            AlbumId                                  Title  ArtistId
         0        1  For Those About To Rock We Salute You         1
         1        2                      Balls to the Wall         2
@@ -1223,11 +1393,9 @@ class DB(object):
     """
         if data:
             q = self._apply_handlebars(q, data, union)
-        if limit==False:
-            pass
-        else:
+        if limit:
             q = self._assign_limit(q, limit)
-        return pd.io.sql.read_sql(q, self.con)
+        return pd.read_sql(q, self.con)
 
     def query_from_file(self, filename, data=None, union=True, limit=None):
         """
@@ -1249,21 +1417,26 @@ class DB(object):
         Examples
         --------
         >>> from db import DemoDB
+        >>> db = DemoDB()
         >>> q = '''
-        SELECT
-          a.Title
-          , t.Name
-          , t.UnitPrice
-        FROM
-          Album a
-        INNER JOIN
-          Track t
-            on a.AlbumId = t.AlbumId;
-        '''
-        >>> with open("myscript.sql", "w") as f:
+        ... SELECT
+        ...   a.Title,
+        ...   t.Name,
+        ...   t.UnitPrice
+        ... FROM
+        ...   Album a
+        ... INNER JOIN
+        ...   Track t
+        ...     on a.AlbumId = t.AlbumId;
+        ... '''
+        >>> with open("db/tests/myscript.sql", "w") as f:
         ...    f.write(q)
-        ...
-        >>> db.query_from_file(q, limit=10)
+        109
+        >>> len(db.query_from_file("db/tests/myscript.sql", limit=10))
+        10
+               
+        
+        db.query_from_file("db/tests/myscript.sql", limit=10)
                                            Title  \
         0  For Those About To Rock We Salute You
         1                      Balls to the Wall
@@ -1288,13 +1461,10 @@ class DB(object):
         8                               Snowballed       0.99
         9                               Evil Walks       0.99
         """
-
         with open(filename) as fp:
             q = fp.read()
-            if data:
-                q = self._apply_handlebars(q, data, union)
 
-        return self.query(q, limit)
+        return self.query(q, data=data, union=union, limit=limit)
 
     def _create_sqlite_metatable(self):
         """
@@ -1305,7 +1475,7 @@ class DB(object):
         rows_to_insert = []
         tables = [row[0] for row in self.cur.execute("select name from sqlite_master where type='table';")]
         for table in tables:
-            for row in self.cur.execute("pragma table_info({0})".format(table)):
+            for row in self.cur.execute("pragma table_info('{0}')".format(table)):
                 rows_to_insert.append((table, row[1], row[2]))
         # find for table and column names
         self.cur.execute("drop table if exists tmp_dbpy_schema;")
@@ -1332,32 +1502,96 @@ class DB(object):
         self.con.commit()
         sys.stderr.write("finished!\n")
 
-    def refresh_schema(self, exclude_system_tables=True):
+    def refresh_schema(self, exclude_system_tables=True, use_cache=False):
         """
         Pulls your database's schema again and looks for any new tables and
         columns.
         """
 
-        sys.stderr.write("Refreshing schema. Please wait...")
-        if self.schemas is not None and isinstance(self.schemas, list) and 'schema_specified' in self._query_templates['system']:
-            schemas_str = ','.join([repr(schema) for schema in self.schemas])
-            q = self._query_templates['system']['schema_specified'] % schemas_str
-        elif exclude_system_tables==True:
-            q = self._query_templates['system']['schema_no_system']
-        else:
-            q = self._query_templates['system']['schema_with_system']
+        col_meta, table_meta = self._get_db_metadata(exclude_system_tables, use_cache)
+        tables = self._gen_tables_from_col_tuples(col_meta)
 
-        tables = set()
-        self.cur.execute(q)
-        cols = []
+        # Three modes for refreshing schema
+        # 1. load directly from cache
+        # 2. use a single query for getting all key relationships
+        # 3. use the naive approach
+        if use_cache:
+            # generate our Tables, and load them into a TableSet
+            self._tables = TableSet([Table(self.con, self._query_templates, table_meta[t]['schema'], t, tables[t],
+                                           keys_per_column=self.keys_per_column,
+                                           foreign_keys=table_meta[t]['foreign_keys']['columns'],
+                                           ref_keys=table_meta[t]['ref_keys']['columns'])
+                                     for t in sorted(tables.keys())])
+
+        # optimize the foreign/ref key query by doing it one time, database-wide, if query is available
+        elif not use_cache and isinstance(self._query_templates.get('system', {}).get('foreign_keys_for_db', None), str):
+
+            self.cur.execute(self._query_templates['system']['foreign_keys_for_db'])
+            table_db_foreign_keys = defaultdict(list)
+            for rel in self.cur:
+                # second value in relationship tuple is the table name
+                table_db_foreign_keys[rel[1]].append(rel)
+
+            self.cur.execute(self._query_templates['system']['ref_keys_for_db'])
+            table_db_ref_keys = defaultdict(list)
+            for rel in self.cur:
+                # second value in relationship tuple is the table name
+                table_db_ref_keys[rel[1]].append(rel)
+
+            # generate our Tables, and load them into a TableSet
+            self._tables = TableSet([Table(self.con, self._query_templates, tables[t][0].schema, t, tables[t],
+                                           keys_per_column=self.keys_per_column,
+                                           foreign_keys=table_db_foreign_keys[t], ref_keys=table_db_ref_keys[t])
+                                     for t in sorted(tables.keys())])
+        elif not use_cache:
+            self._tables = TableSet([Table(self.con, self._query_templates, tables[t][0].schema, t, tables[t],
+                                           keys_per_column=self.keys_per_column) for t in sorted(tables.keys())])
+
+        sys.stderr.write("done!\n")
+
+    def _get_db_metadata(self, exclude_system_tables, use_cache):
+
+        col_meta = []
+        table_meta = {}
+
+        # pull out column metadata for all tables as list of tuples if told to use cached metadata
+        if use_cache and self._metadata_cache:
+            sys.stderr.write("Loading cached metadata. Please wait...")
+
+            for table in self._metadata_cache:
+
+                # table metadata
+                table_meta[table['name']] = {k: table[k] for k in ('schema', 'name', 'foreign_keys', 'ref_keys')}
+
+                # col metadata: format as list of tuples, to match how normal loading is performed
+                for col in table['columns']:
+                    col_meta.append((col['schema'], col['table'], col['name'], col['type']))
+        else:
+            sys.stderr.write("Refreshing schema. Please wait...")
+            if self.schemas is not None and isinstance(self.schemas, list) and 'schema_specified' in \
+                    self._query_templates['system']:
+                schemas_str = ','.join([repr(schema) for schema in self.schemas])
+                q = self._query_templates['system']['schema_specified'] % schemas_str
+            elif exclude_system_tables:
+                q = self._query_templates['system']['schema_no_system']
+            else:
+                q = self._query_templates['system']['schema_with_system']
+            self.cur.execute(q)
+            col_meta = self.cur
+
+        return col_meta, table_meta
+
+    def _gen_tables_from_col_tuples(self, cols):
+
         tables = {}
-        for (table_name, column_name, data_type)in self.cur:
+        # generate our Columns, and attach to each table to the table name in dict
+        for (table_schema, table_name, column_name, data_type) in cols:
             if table_name not in tables:
                 tables[table_name] = []
-            tables[table_name].append(Column(self.con, self._query_templates, table_name, column_name, data_type, self.keys_per_column))
+            tables[table_name].append(Column(self.con, self._query_templates, table_schema,
+                                             table_name, column_name, data_type, self.keys_per_column))
 
-        self.tables = TableSet([Table(self.con, self._query_templates, t, tables[t], keys_per_column=self.keys_per_column) for t in sorted(tables.keys())])
-        sys.stderr.write("done!\n")
+        return tables
 
     def _try_command(self, cmd):
         try:
@@ -1447,6 +1681,7 @@ class DB(object):
         sys.stderr.write("Transfering {0} to s3 in chunks".format(name))
         len_df = len(df)
         chunks = range(0, len_df, chunk_size)
+
         def upload_chunk(i):
             conn = S3Connection(AWS_ACCESS_KEY, AWS_SECRET_KEY)
             chunk = df[i:(i+chunk_size)]
@@ -1510,14 +1745,29 @@ class DB(object):
             conn.delete_bucket(bucket_name)
         sys.stderr.write("done!")
 
+    def to_dict(self):
+        """Dict representation of the database as credentials plus tables dict representation."""
+        db_dict = self.credentials
+        db_dict.update(self.tables.to_dict())
+        return db_dict
+
+
+def load_from_json(file_path):
+    """Load the stored data from json, and return as a dict."""
+    if os.path.exists(file_path):
+        raw_data = open(file_path, 'rb').read()
+        return json.loads(base64.decodestring(raw_data).decode('utf-8'))
+
+
 def list_profiles():
     """
     Lists all of the database profiles available
 
     Examples
     --------
-    >>> from db import list_profiles
-    >>> list_profiles()
+    No doctest, covered by unittest
+    
+    list_profiles()
     {'demo': {u'dbname': None,
       u'dbtype': u'sqlite',
       u'filename': u'/Users/glamp/repos/yhat/opensource/db.py/db/data/chinook.sqlite',
@@ -1537,21 +1787,26 @@ def list_profiles():
     user = os.path.expanduser("~")
     for f in os.listdir(user):
         if f.startswith(".db.py_"):
-            profile = os.path.join(user, f)
-            profile = json.loads(base64.decodestring(open(profile).read()))
+            profile = load_from_json(os.path.join(user, f))
+            tables = profile.pop('tables', None)
+            if tables:
+                profile['metadata'] = True
+            else:
+                profile['metadata'] = False
             profiles[f[7:]] = profile
     return profiles
 
 
 def remove_profile(name, s3=False):
     """
-    Removes a profile from your config
+    Removes a profile from your config   
+    
     """
     user = os.path.expanduser("~")
-    if s3==True:
-        f = os.path.join(user, ".db.py_s3_" + name)
+    if s3:
+        f = os.path.join(user, S3_PROFILE_ID + name)
     else:
-        f = os.path.join(user, ".db.py_" + name)
+        f = os.path.join(user, DBPY_PROFILE_ID + name)
     try:
         try:
             open(f)
@@ -1562,11 +1817,20 @@ def remove_profile(name, s3=False):
         raise Exception("Could not remove profile {0}! Excpetion: {1}".format(name, e))
 
 
-def DemoDB(keys_per_column=None):
+def dump_to_json(file_path, data):
+    with open(file_path, 'wb') as f:
+        json_data = json.dumps(data)
+        try:
+            f.write(base64.encodestring(json_data))
+        except:
+            f.write(base64.encodestring(bytes(json_data, 'utf-8')))
+
+
+def DemoDB(keys_per_column=None, **kwargs):
     """
     Provides an instance of DB that hooks up to the Chinook DB
     See http://chinookdatabase.codeplex.com/ for more info.
     """
     _ROOT = os.path.abspath(os.path.dirname(__file__))
     chinook = os.path.join(_ROOT, 'data', "chinook.sqlite")
-    return DB(filename=chinook, dbtype="sqlite", keys_per_column=keys_per_column)
+    return DB(filename=chinook, dbtype="sqlite", keys_per_column=keys_per_column, **kwargs)
